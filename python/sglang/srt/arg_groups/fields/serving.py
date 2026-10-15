@@ -108,6 +108,16 @@ class Serving(msgspec.Struct):
         ),
     ] = None
     skip_server_warmup: A[bool, "If set, skip warmup."] = False
+    enable_checkpoint: A[
+        bool,
+        "Enable the /checkpoint/prepare, /checkpoint/status and /checkpoint/resume "
+        "routes, so an external orchestrator can checkpoint and restore the server.",
+    ] = False
+    checkpoint_at_startup: A[
+        bool,
+        "Prepare for a checkpoint right after warmup, before serving any request. "
+        "Requires --enable-checkpoint.",
+    ] = False
     warmups: A[
         Optional[str],
         "Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",

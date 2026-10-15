@@ -75,6 +75,12 @@ from sglang.srt.entrypoints.anthropic.protocol import (
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.api_contract import generate_contract_error
+from sglang.srt.entrypoints.checkpoint import (
+    CheckpointConflict,
+    CheckpointLifecycle,
+    CheckpointState,
+    validate_checkpoint_args,
+)
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -214,6 +220,7 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    checkpoint: Optional[CheckpointLifecycle] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -492,6 +499,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_CHECKPOINT_ADMITTED_PATHS = (
+    "/checkpoint/",
+    "/health",
+    "/health_generate",
+    "/ready",
+    "/metrics",
+    "/model_info",
+    "/get_model_info",
+    "/server_info",
+    "/get_server_info",
+    "/v1/models",
+)
+
+
+@app.middleware("http")
+async def checkpoint_admission(request: Request, call_next):
+    checkpoint = _global_state.checkpoint if _global_state is not None else None
+    if (
+        checkpoint is not None
+        and not checkpoint.admitting
+        and not request.url.path.startswith(_CHECKPOINT_ADMITTED_PATHS)
+    ):
+        return ORJSONResponse(
+            content={"error": f"Server is {checkpoint.state.value} for a checkpoint"},
+            status_code=503,
+        )
+    return await call_next(request)
+
+
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
         RequestDecompressionMiddleware,
@@ -698,8 +734,11 @@ async def validate_json_request(raw_request: Request):
 @app.get("/ready")
 async def ready() -> Response:
     """Report whether the server is ready to receive new requests."""
-    status_code = 200 if _global_state.tokenizer_manager.is_ready() else 503
-    return Response(status_code=status_code)
+    checkpoint = _global_state.checkpoint
+    ready = _global_state.tokenizer_manager.is_ready() and (
+        checkpoint is None or checkpoint.admitting
+    )
+    return Response(status_code=200 if ready else 503)
 
 
 @app.get("/health")
@@ -715,6 +754,10 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
         return Response(status_code=503)
+
+    checkpoint = _global_state.checkpoint
+    if checkpoint is not None and not checkpoint.admitting:
+        return Response(status_code=200 if checkpoint.healthy else 503)
 
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
@@ -1787,6 +1830,48 @@ async def continue_generation(
     )
 
 
+def _checkpoint_response(step: Optional[Callable[[CheckpointLifecycle], None]]):
+    checkpoint = _global_state.checkpoint
+    if checkpoint is None:
+        return ORJSONResponse(
+            content={"error": "Checkpointing is not enabled, see --enable-checkpoint"},
+            status_code=404,
+        )
+    if step is not None:
+        try:
+            step(checkpoint)
+        except CheckpointConflict as e:
+            return ORJSONResponse(
+                content={"error": str(e), **checkpoint.status()}, status_code=409
+            )
+        return ORJSONResponse(content=checkpoint.status(), status_code=200)
+    prepared = checkpoint.state == CheckpointState.PREPARED
+    return ORJSONResponse(
+        content=checkpoint.status(), status_code=200 if prepared else 503
+    )
+
+
+@app.post("/checkpoint/prepare")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def checkpoint_prepare(request: Request):
+    """Get ready for a checkpoint: drain, release memory, then report prepared."""
+    return _checkpoint_response(CheckpointLifecycle.prepare)
+
+
+@app.get("/checkpoint/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def checkpoint_status(request: Request):
+    """Return 200 once the server is safe to checkpoint, 503 until then."""
+    return _checkpoint_response(None)
+
+
+@app.post("/checkpoint/resume")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def checkpoint_resume(request: Request):
+    """Go back to serving after a restore."""
+    return _checkpoint_response(CheckpointLifecycle.resume)
+
+
 ##### OpenAI-compatible API endpoints #####
 
 
@@ -2421,7 +2506,8 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            if not _mark_server_up(server_args):
+                return False
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2478,6 +2564,38 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
         logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
+def _prepare_checkpoint_at_startup(server_args: ServerArgs) -> bool:
+    key = get_serving().admin_api_key or get_serving().api_key
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        requests.post(
+            server_args.url() + "/checkpoint/prepare",
+            headers=headers,
+            timeout=10,
+            verify=ssl_verify_of(server_args),
+        ).raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.exception("Checkpoint prepare at startup failed")
+        return False
+    checkpoint = _global_state.checkpoint
+    while checkpoint.state == CheckpointState.PREPARING:
+        time.sleep(0.5)
+    if checkpoint.state != CheckpointState.PREPARED:
+        logger.error("Checkpoint prepare at startup failed: %s", checkpoint.error)
+        return False
+    logger.info("Prepared for a checkpoint at startup")
+    return True
+
+
+def _mark_server_up(server_args: ServerArgs) -> bool:
+    if get_serving().checkpoint_at_startup and not _prepare_checkpoint_at_startup(
+        server_args
+    ):
+        return False
+    _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    return True
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2497,8 +2615,8 @@ def _wait_and_warmup(
     if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
-    else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+    elif not _mark_server_up(server_args):
+        return
 
     _freeze_gc_after_server_warmup(server_args)
 
@@ -2635,12 +2753,20 @@ def _setup_and_run_http_server(
 
     Called by launch_server after subprocesses have been launched.
     """
+    checkpoint = None
+    if get_serving().enable_checkpoint:
+        validate_checkpoint_args()
+        checkpoint = CheckpointLifecycle(tokenizer_manager)
+    elif get_serving().checkpoint_at_startup:
+        raise ValueError("--checkpoint-at-startup requires --enable-checkpoint")
+
     # Set global states
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
+            checkpoint=checkpoint,
         )
     )
 
